@@ -1,33 +1,50 @@
-import hashlib
+import os
+import shutil
+from datetime import datetime
+from typing import List, Optional
 
-import requests
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import FastAPI, Depends, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from sqlalchemy import (
-    Column,
-    Double,
-    ForeignKey,
-    Integer,
-    String,
-    TIMESTAMP,
-    Text,
-    create_engine,
-    text,
-)
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy import create_engine, Column, Integer, String, TIMESTAMP, text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
 
-
-# Configuración de conexión a MySQL
-DATABASE_URL = "mysql+pymysql://root:@localhost/asistencia_gps"
+# 1. Configuración de la Base de Datos MySQL
+DATABASE_URL = "mysql+pymysql://root:@localhost/mi_base_de_datos"
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-app = FastAPI()
+# 2. Modelo SQLAlchemy (Tabla P10_foto)
+class FotoDB(Base):
+    __tablename__ = "p10_foto"
 
-# Habilitar CORS para peticiones desde Flutter
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    descripcion = Column(String(255), nullable=False)
+    ruta_foto = Column(String(255), nullable=False)
+    fecha = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
+
+# 3. Esquemas Pydantic para validación y respuesta
+class FotoSchema(BaseModel):
+    id: int
+    descripcion: str
+    ruta_foto: str
+    fecha: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+class FotoResponse(BaseModel):
+    msg: str
+    foto: FotoSchema
+
+# 4. Inicialización de la App FastAPI
+app = FastAPI(title="API Gestión de Imágenes - Práctica 10")
+
+# Configurar CORS para permitir peticiones desde Flutter
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,48 +53,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Crear carpeta 'uploads' si no existe y montarla como archivos estáticos
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
-# --- MODELOS SQLALCHEMY ---
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String(50), unique=True, nullable=False)
-    password = Column(String(32), nullable=False)
-
-
-class Attendance(Base):
-    __tablename__ = "attendance"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    latitude = Column(Double, nullable=False)
-    longitude = Column(Double, nullable=False)
-    address = Column(Text, nullable=False)
-    created_at = Column(TIMESTAMP, server_default=text("CURRENT_TIMESTAMP"))
-
-
-Base.metadata.create_all(bind=engine)
-
-
-# --- MODELOS PYDANTIC ---
-class RegisterModel(BaseModel):
-    username: str
-    password: str
-
-
-class LoginModel(BaseModel):
-    username: str
-    password: str
-
-
-class AttendanceModel(BaseModel):
-    user_id: int
-    latitude: float
-    longitude: float
-
-
-# --- UTILIDADES ---
+# Dependencia para obtener la sesión de BD
 def get_db():
     db = SessionLocal()
     try:
@@ -85,115 +66,36 @@ def get_db():
     finally:
         db.close()
 
-
-def md5_hash(password: str) -> str:
-    return hashlib.md5(password.encode()).hexdigest()
-
-
-def get_address_from_nominatim(lat: float, lon: float) -> str:
-    url = (
-        "https://nominatim.openstreetmap.org/reverse"
-        f"?format=json&lat={lat}&lon={lon}"
-    )
-    headers = {"User-Agent": "FlutterAttendanceApp/1.0"}
-
+# 5. Endpoints
+@app.post("/fotos", response_model=FotoResponse)
+async def subir_foto(
+    descripcion: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    # Guardar el archivo físicamente en la carpeta uploads/
+    ruta_archivo = f"{UPLOAD_DIR}/{file.filename}"
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            return data.get("display_name", "Dirección no encontrada")
-    except Exception:
-        pass
+        with open(ruta_archivo, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al guardar imagen: {str(e)}")
 
-    return "Error al consultar la dirección"
-
-
-# --- ENDPOINTS ---
-@app.post("/register/")
-def register(user: RegisterModel, db: Session = Depends(get_db)):
-    existing = db.query(User).filter(User.username == user.username).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="El usuario ya existe")
-
-    new_user = User(
-        username=user.username,
-        password=md5_hash(user.password),
+    # Guardar el registro en MySQL
+    nueva_foto = FotoDB(
+        descripcion=descripcion,
+        ruta_foto=ruta_archivo
     )
-    db.add(new_user)
+    db.add(nueva_foto)
     db.commit()
-    db.refresh(new_user)
+    db.refresh(nueva_foto)
 
     return {
-        "message": "Usuario registrado exitosamente",
-        "user_id": new_user.id,
+        "msg": "Foto subida correctamente",
+        "foto": nueva_foto
     }
 
-
-@app.post("/login/")
-def login(user: LoginModel, db: Session = Depends(get_db)):
-    hashed_pw = md5_hash(user.password)
-    db_user = (
-        db.query(User)
-        .filter(User.username == user.username, User.password == hashed_pw)
-        .first()
-    )
-    if not db_user:
-        raise HTTPException(status_code=401, detail="Credenciales incorrectas")
-
-    return {
-        "message": "Login exitoso",
-        "user_id": db_user.id,
-        "username": db_user.username,
-    }
-
-
-@app.post("/attendance/")
-def register_attendance(data: AttendanceModel, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.id == data.user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado")
-
-    address = get_address_from_nominatim(data.latitude, data.longitude)
-
-    new_record = Attendance(
-        user_id=data.user_id,
-        latitude=data.latitude,
-        longitude=data.longitude,
-        address=address,
-    )
-    db.add(new_record)
-    db.commit()
-    db.refresh(new_record)
-
-    return {
-        "message": "Asistencia registrada",
-        "address": address,
-        "latitude": data.latitude,
-        "longitude": data.longitude,
-    }
-
-
-@app.get("/attendance/")
-def get_attendance(user_id: int, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado")
-
-    records = (
-        db.query(Attendance)
-        .filter(Attendance.user_id == user_id)
-        .order_by(Attendance.created_at.desc())
-        .all()
-    )
-
-    return [
-        {
-            "id": record.id,
-            "user_id": record.user_id,
-            "latitude": record.latitude,
-            "longitude": record.longitude,
-            "address": record.address,
-            "created_at": record.created_at,
-        }
-        for record in records
-    ]
+@app.get("/fotos", response_model=List[FotoSchema])
+def listar_fotos(db: Session = Depends(get_db)):
+    fotos = db.query(FotoDB).all()
+    return fotos
